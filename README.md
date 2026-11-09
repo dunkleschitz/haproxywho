@@ -147,7 +147,9 @@ are the only oracle, exactly as the manual text is the only authority.
 - [x] Tests green (69/69)
 - [x] Dogfood: doccover + clicheck clean (Nov 9: clicheck 15/15, doccover 11/11)
 - [x] Bench-audit map extended (Nov 9: A1–A7 clean)
-- [ ] README + CHANGELOG + LICENSE (MIT) in place
+- [x] README + CHANGELOG + LICENSE (MIT) in place
+- [x] CI workflow (.github/workflows/tests.yml, Python 3.12)
+- [x] Prepublish-check clean (Nov 9: stdlib-only, no secret-like literals)
 
 ## License
 
