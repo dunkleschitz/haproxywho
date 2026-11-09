@@ -1,0 +1,2177 @@
+#!/usr/bin/env python3
+"""haproxywho - which backend would serve Host H path P, and which
+`use_backend` line decided it.
+
+A static model of HAProxy's documented routing rules
+(DESIGN-haproxywho.md, BUILD APPROVED 2026-11-09). Semantics pinned
+to the HAProxy Configuration Manual, 2.6 LTS - 3.2 range. Claims are
+tagged [documented], [docs-inferred], or [hypothesized]; no haproxy
+binary exists on this box, so no claim here is [observed] and there
+is no live-agreement test to skip-guard against: `haproxy -c`
+validates syntax but dumps no routing decisions, so hermetic
+fixture trees are the only oracle.
+
+Pinned semantics (HA01-HA24 in the design doc):
+- HA01 frontend selection is by bind socket, never by Host. A bare
+  query is evaluated in every HTTP frontend; agreement is the
+  answer, disagreement is BIND-AMBIGUOUS. --port/--bind restrict.
+- HA02 mode resolves own, then defaults chain, else TCP (the
+  default). Only mode http frontends get verdicts.
+- HA03 defaults scope preceding-only and reset at the next defaults
+  section; named selection via `from` (2.4+) chains transitively.
+  ACLs never live in defaults; use_backend never does either.
+- HA04 ACLs are section-local, name-accumulating (OR across lines),
+  case-sensitive; forward references resolve.
+- HA05 condition grammar: [if|unless] term [term ...] [or ...];
+  terms ANDed, `or` separates AND-groups; `!` negates one term;
+  anonymous `{ ... }` ACLs; predefined TRUE/FALSE/METH_*/LOCALHOST/
+  HTTP.
+- HA06 first matching use_backend wins (declaration order), else
+  default_backend (own, else defaults), else listen-self, else
+  NO-BACKEND (503).
+- HA07 statically evaluable fetch set: hdr(host), path, pathq, url,
+  method, src, dst, dst_port, *_len, always_true/false. Anything
+  else is HA12.
+- HA08 Host matched verbatim, port included; a port-stripped check
+  is shown only as a displayed alternative, never the verdict.
+- HA09 path is verbatim, query excluded from `path`, included in
+  `pathq`/`url`; no normalization.
+- HA10 three-valued (Kleene) conditions: TRUE/FALSE/UNKNOWN.
+  Unknown terms poison a verdict only when they could change the
+  winner.
+- HA11 `-f` pattern files expanded when readable (relative to the
+  config directory); missing/unreadable is unmodeled, never an
+  empty pattern list. `virt@` and `-M` maps are unmodeled.
+- HA12 unmodeled dynamism (maps, stick tables, ssl_fc, var(),
+  converters, ...) is bannered and UNKNOWN-poisoning, never
+  approximated.
+- HA13 http-request rewrites run BEFORE backend selection: a
+  rewrite that may have fired makes the verdict UNKNOWN, citing
+  the rule. HA14 terminating rules (deny/redirect/return/tarpit/
+  silent-drop/block) short-circuit the request.
+- HA15 regex is an approximation: POSIX classes translated to
+  Python re where they coincide; untranslatable patterns are
+  UNKNOWN; regex-decided verdicts carry [regex-approx].
+- HA16-HA24 structural findings, coverage on every run, exact
+  verdict vocabulary, exit codes 0/1/2.
+
+The tool never runs haproxy, never opens a socket, never writes,
+never reads the process environment (HA18), and opens config and
+`-f` pattern files read-only.
+
+Exit codes: 0 verdict BACKEND rendered (default-fallback and
+listen-self included, labeled), or --list-frontends with >=1 proxy;
+1 NO-BACKEND, SHORT-CIRCUIT, BIND-AMBIGUOUS, NO-FRONTEND,
+NO-HTTP-FRONTEND, or UNKNOWN; 2 usage error, missing config,
+.include cycle, a file opening mid-section, or a --path not
+starting with `/`.
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------- findings
+
+class Finding:
+    """One structural finding. `fid` is a design-doc id (HA01..HA24)
+    or "GEN" for a generic loader problem; `severity` is one of
+    "finding", "warning", "info". `where` is "path:line" or None."""
+    def __init__(self, fid, severity, message, where=None):
+        self.fid = fid
+        self.severity = severity
+        self.message = message
+        self.where = where
+
+    def text(self):
+        loc = " (%s)" % self.where if self.where else ""
+        return "[%s] %s: %s%s" % (self.fid, self.severity, self.message, loc)
+
+    def as_json(self):
+        return {"id": self.fid, "severity": self.severity,
+                "message": self.message, "where": self.where}
+
+
+class FatalConfig(Exception):
+    """A loader defect that ends the run (exit 2): .include cycle,
+    a top-level file opening mid-section, unreadable config."""
+    def __init__(self, message, where=None):
+        super().__init__(message)
+        self.message = message
+        self.where = where
+
+
+# ------------------------------------------------------------- three-valued
+
+# Kleene three-valued logic values.
+TRUE = "TRUE"
+FALSE = "FALSE"
+UNKNOWN = "UNKNOWN"
+
+
+def tri_and(vals):
+    if FALSE in vals:
+        return FALSE
+    if UNKNOWN in vals:
+        return UNKNOWN
+    return TRUE
+
+
+def tri_or(vals):
+    if TRUE in vals:
+        return TRUE
+    if UNKNOWN in vals:
+        return UNKNOWN
+    return FALSE
+
+
+def tri_not(val):
+    if val == TRUE:
+        return FALSE
+    if val == FALSE:
+        return TRUE
+    return UNKNOWN
+
+
+# --------------------------------------------------------------- tokenizing
+
+def tokenize(line):
+    """Split a config line into tokens. `#` starts a comment outside
+    quotes; single/double quotes group one token; a `#` inside
+    quotes is literal. Backslash escapes the next char inside
+    quotes. [documented, manual SS2.1/SS2.2]"""
+    tokens = []
+    cur = []
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote is not None:
+            if ch == "\\" and i + 1 < len(line):
+                cur.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "#":
+            break
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch.isspace():
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
+ENV_REF_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)|\$\{[^}]*\}")
+
+
+def has_env_ref(text):
+    return bool(ENV_REF_RE.search(text))
+
+
+# ------------------------------------------------------------ regex (HA15)
+
+POSIX_CLASSES = {
+    "alpha": "a-zA-Z", "digit": "0-9", "alnum": "a-zA-Z0-9",
+    "space": r"\s", "upper": "A-Z", "lower": "a-z",
+    "xdigit": "0-9A-Fa-f",
+    "punct": r"""!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~""",
+    "cntrl": r"\x00-\x1f\x7f", "print": r"\x20-\x7e",
+    "graph": r"\x21-\x7e", "blank": " \t",
+}
+
+
+def translate_regex(pattern):
+    """Translate a HAProxy (POSIX-ERE or PCRE, build-dependent)
+    pattern to Python `re`. Returns the translated pattern, or None
+    when the pattern uses constructs Python `re` cannot express the
+    same way -- the caller then treats the term as UNKNOWN, never a
+    guess. [regex-approx]"""
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "[" and i + 1 < n and pattern[i + 1] == ":":
+            # POSIX class [:name:] inside a bracket expression.
+            j = pattern.find(":]", i + 2)
+            if j == -1:
+                return None
+            name = pattern[i + 2:j]
+            neg = name.startswith("^")
+            if neg:
+                name = name[1:]
+            if name not in POSIX_CLASSES:
+                return None
+            out.append(("^" if neg else "") + POSIX_CLASSES[name])
+            i = j + 2
+            continue
+        if ch == "(" and i + 1 < n and pattern[i + 1] == "?":
+            # (?...) groups: only (?:...) is safe to carry over.
+            if pattern.startswith("(?:", i):
+                out.append("(?:")
+                i += 3
+                continue
+            return None
+        if ch == "\\" and i + 1 < n:
+            nxt = pattern[i + 1]
+            # Backreferences in matching are fine in Python re.
+            if nxt.isdigit() and nxt != "0":
+                out.append("\\" + nxt)
+                i += 2
+                continue
+            if nxt in "dDsSwWbB":
+                out.append("\\" + nxt)
+                i += 2
+                continue
+            if nxt == "k":
+                return None  # \k<name> named backref: not portable
+            out.append("\\" + nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def regex_match(pattern, value):
+    """Return TRUE/FALSE/UNKNOWN for a regex match attempt. The
+    pattern is a HAProxy regex; translation failure is UNKNOWN."""
+    translated = translate_regex(pattern)
+    if translated is None:
+        return UNKNOWN
+    try:
+        return TRUE if re.search(translated, value) else FALSE
+    except re.error:
+        return UNKNOWN
+
+
+# ------------------------------------------------------------- match methods
+
+MATCH_METHODS = ("str", "beg", "end", "sub", "dom", "dir", "reg",
+                 "len", "int", "found")
+INT_OPERATORS = ("eq", "ge", "gt", "le", "lt")
+FETCH_SUFFIX_METHODS = ("beg", "end", "sub", "dom", "dir", "len",
+                        "reg")
+
+
+def match_str(method, value, pattern, case_insensitive):
+    """String match of one pattern against one value. Returns a
+    three-valued result (regex translation failure -> UNKNOWN)."""
+    if case_insensitive:
+        value = value.lower()
+        pattern = pattern.lower()
+    if method in (None, "str"):
+        return TRUE if value == pattern else FALSE
+    if method == "beg":
+        return TRUE if value.startswith(pattern) else FALSE
+    if method == "end":
+        return TRUE if value.endswith(pattern) else FALSE
+    if method == "sub":
+        return TRUE if pattern in value else FALSE
+    if method == "dom":
+        # Dot-boundary suffix-or-equal: example.com dom-matches
+        # www.example.com and itself, not badexample.com.
+        if value == pattern or value.endswith("." + pattern):
+            return TRUE
+        return FALSE
+    if method == "dir":
+        if value == pattern or value.startswith(pattern + "/"):
+            return TRUE
+        return FALSE
+    if method == "reg":
+        return regex_match(pattern, value)
+    if method == "found":
+        return TRUE if value else FALSE
+    return UNKNOWN
+
+
+def match_int(operator, value, pattern):
+    """Integer comparison. `pattern` may be a single integer or a
+    range "lo-hi". Returns TRUE/FALSE/UNKNOWN."""
+    try:
+        if "-" in pattern and not pattern.startswith("-"):
+            lo, hi = pattern.split("-", 1)
+            lo, hi = int(lo), int(hi)
+            return TRUE if lo <= value <= hi else FALSE
+        num = int(pattern)
+    except ValueError:
+        return UNKNOWN
+    op = operator or "eq"
+    if op == "eq":
+        return TRUE if value == num else FALSE
+    if op == "ge":
+        return TRUE if value >= num else FALSE
+    if op == "gt":
+        return TRUE if value > num else FALSE
+    if op == "le":
+        return TRUE if value <= num else FALSE
+    if op == "lt":
+        return TRUE if value < num else FALSE
+    return UNKNOWN
+
+
+def ip_matches(pattern, addr):
+    """Does IP `addr` match `pattern` (IP, CIDR, or range)?
+    Returns TRUE/FALSE, or UNKNOWN when the pattern is not an IP
+    form at all (e.g. a hostname -- unresolvable statically)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return UNKNOWN
+    pat = pattern.strip()
+    try:
+        if "/" in pat:
+            net = ipaddress.ip_network(pat, strict=False)
+            return TRUE if ip in net else FALSE
+        if "-" in pat:
+            lo, hi = pat.split("-", 1)
+            lo_ip = ipaddress.ip_address(lo.strip())
+            hi_ip = ipaddress.ip_address(hi.strip())
+            return TRUE if lo_ip <= ip <= hi_ip else FALSE
+        return TRUE if ip == ipaddress.ip_address(pat) else FALSE
+    except ValueError:
+        return UNKNOWN
+    except TypeError:
+        # IPv4 pattern against an IPv6 address (or vice versa):
+        # cannot match.
+        return FALSE
+
+# ------------------------------------------------------------ data model
+
+SECTION_KINDS = (
+    "global", "defaults", "frontend", "backend", "listen", "peers",
+    "resolvers", "cache", "mailers", "ring", "log-forward",
+    "fcgi-app", "userlist", "program", "http-errors",
+)
+PROXY_KINDS = ("frontend", "backend", "listen")
+
+# Keywords recognized (skipped cleanly, never poison) in proxy
+# sections, from the manual SS4.1 keyword matrix -- the recognizer
+# is generous; only lines matching no known shape are HA21.
+RECOGNIZED_KEYWORDS = set("""
+acl address allow balance bind capture compression cookie
+default_backend default-server default_backend description
+disabled dynamic-cookie-key errorfile errorloc errorloc302
+external-check-command filter force-persist fullconn hash-type
+http-after-response http-buffer-request http-check http-request
+http-response http-reuse http-send-name-header http-set-header
+id ignore-persist load-server-state-from-file log log-format
+log-tag maxconn max-queue monitor-fail monitor-net monitor-uri
+mode no option persist redispatch retries server setenv presetenv
+source stats stick stick-table tcp-check tcp-request tcp-response
+timeout unique-id-format unique-id-header use_backend use-server
+""".split()) | set("""
+backlog bind-process cliexp compression default-server
+http-keep-alive http-use-htx maxconnrate no option queue
+""".split())
+
+
+class AclCriterion:
+    """One parsed ACL criterion (one `acl` line, or one anonymous
+    `{ ... }` expression). `status` is "ok" or "unmodeled" (HA12);
+    `unmodeled_reason` names why."""
+    def __init__(self, fetch, arg, method, flags, patterns,
+                 status="ok", unmodeled_reason=None, where=None):
+        self.fetch = fetch          # normalized base fetch name
+        self.arg = arg              # e.g. header name for hdr()
+        self.method = method        # match method or None
+        self.flags = flags          # dict: i, m, n, u, files
+        self.patterns = patterns    # list of (pattern, provenance)
+        self.status = status
+        self.unmodeled_reason = unmodeled_reason
+        self.where = where
+
+    def __repr__(self):
+        return "AclCriterion(%s%s, %s, %r)" % (
+            self.fetch, ("(" + self.arg + ")") if self.arg else "",
+            self.method, self.patterns)
+
+
+class UseBackendRule:
+    def __init__(self, target, cond_tokens, where, dynamic=False):
+        self.target = target
+        self.cond_tokens = cond_tokens  # None => unconditional
+        self.where = where
+        self.dynamic = dynamic
+
+
+class HttpRequestRule:
+    def __init__(self, action, args, cond_tokens, where):
+        self.action = action
+        self.args = args
+        self.cond_tokens = cond_tokens
+        self.where = where
+
+
+class Section:
+    def __init__(self, kind, name, from_name, where, order):
+        self.kind = kind
+        self.name = name
+        self.from_name = from_name
+        self.where = where            # "path:line" of the header
+        self.order = order
+        self.binds = []               # list of (addr, port) ; port may be (lo,hi)
+        self.mode = None              # (value, where)
+        self.default_backend = None   # (name, where)
+        self.disabled = False
+        self.acls = {}                # name -> [AclCriterion]
+        self.use_backends = []        # [UseBackendRule]
+        self.http_requests = []       # [HttpRequestRule]
+        self.unparseable = []         # [(line, where)]
+        self.stick_table = False
+        self.gated = []               # gated (skipped) line ranges
+
+    def __repr__(self):
+        return "<%s %s>" % (self.kind, self.name or "")
+
+
+class Config:
+    def __init__(self):
+        self.sections = []
+        self.files = []               # [(path, bytes, lines)]
+        self.findings = []
+        self.gated_blocks = []        # [(where, section_name, reason)]
+        self.defaults_by_name = {}
+
+    def add_finding(self, fid, severity, message, where=None):
+        self.findings.append(Finding(fid, severity, message, where))
+
+    def proxies(self):
+        return [s for s in self.sections if s.kind in PROXY_KINDS]
+
+    def frontends(self):
+        return [s for s in self.sections
+                if s.kind in ("frontend", "listen")]
+
+    def find_backend(self, name):
+        """First definition wins (HA16: duplicates are a finding,
+        references resolve to the first)."""
+        for s in self.sections:
+            if s.kind in ("backend", "listen") and s.name == name:
+                return s
+        return None
+
+    def find_defaults(self, name):
+        for s in self.sections:
+            if s.kind == "defaults" and s.name == name:
+                return s
+        return None
+
+
+# ------------------------------------------------------- criterion parsing
+
+def parse_fetch_token(token):
+    """Split a fetch token into (base, arg, suffix_method, converter).
+    `hdr(host)` -> ("hdr", "host", None, False);
+    `path_beg` -> ("path", None, "beg", False);
+    `hdr_reg(host)` -> ("hdr", "host", "reg", False);
+    `req.hdr(host)` -> ("hdr", "host", None, False);
+    `path,lower,map(...)` -> converter chain -> (..., True)."""
+    if "," in token:
+        return None, None, None, True
+    m = re.match(r"^([A-Za-z0-9_.]+)(?:\((.*)\))?$", token)
+    if not m:
+        return None, None, None, False
+    raw = m.group(1)
+    arg = m.group(2)
+    # Strip req./res. prefixes (req.hdr(host) == hdr(host)).
+    for prefix in ("req.", "res."):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    method = None
+    base = raw
+    for suffix in FETCH_SUFFIX_METHODS:
+        if raw.endswith("_" + suffix):
+            base = raw[:-(len(suffix) + 1)]
+            method = suffix
+            break
+    return base, arg, method, False
+
+
+EVALUABLE_FETCHES = ("hdr", "path", "pathq", "url", "method", "src",
+                     "dst", "dst_port", "always_true", "always_false")
+
+
+def parse_criterion(tokens, where, config_dir, cfg):
+    """Parse the tokens after `acl NAME` (or inside `{ ... }`) into
+    an AclCriterion. Flags: -i -m <meth> -n -u -f <file> --.
+    `-f` files are expanded when readable (HA11); a missing file
+    makes the criterion unmodeled, never an empty pattern list."""
+    if not tokens:
+        return AclCriterion(None, None, None, {}, [],
+                            status="unmodeled",
+                            unmodeled_reason="empty ACL expression",
+                            where=where)
+    fetch_tok = tokens[0]
+    base, arg, suffix_method, converter = parse_fetch_token(fetch_tok)
+    flags = {"i": False, "n": False, "u": False, "files": []}
+    method = suffix_method
+    operator = None
+    rest = tokens[1:]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok == "-i":
+            flags["i"] = True
+            i += 1
+        elif tok == "-n":
+            flags["n"] = True
+            i += 1
+        elif tok == "-u":
+            flags["u"] = True
+            i += 1
+        elif tok == "-m":
+            if i + 1 >= len(rest):
+                return AclCriterion(base, arg, method, flags, [],
+                                    status="unmodeled",
+                                    unmodeled_reason="-m with no method",
+                                    where=where)
+            method = rest[i + 1]
+            i += 2
+        elif tok == "-f":
+            if i + 1 >= len(rest):
+                return AclCriterion(base, arg, method, flags, [],
+                                    status="unmodeled",
+                                    unmodeled_reason="-f with no file",
+                                    where=where)
+            flags["files"].append(rest[i + 1])
+            i += 2
+        elif tok == "-M":
+            return AclCriterion(base, arg, method, flags, [],
+                                status="unmodeled",
+                                unmodeled_reason="-M map file (HA11/HA12)",
+                                where=where)
+        elif tok.startswith("-"):
+            # Unknown flag: the criterion cannot be tokenized
+            # cleanly -- HA21 territory, handled by the caller as
+            # unmodeled with the flag named.
+            return AclCriterion(base, arg, method, flags, [],
+                                status="unmodeled",
+                                unmodeled_reason="unknown flag %s" % tok,
+                                where=where)
+        else:
+            break
+    patterns = []
+    pat_tokens = rest[i:]
+    # Bare operator words for integer fetches / explicit methods.
+    if pat_tokens and method is None and base in (
+            "path_len", "url_len", "dst_port", "hdr_len", "src"):
+        if pat_tokens[0] in INT_OPERATORS:
+            operator = pat_tokens[0]
+            pat_tokens = pat_tokens[1:]
+        elif pat_tokens[0] in MATCH_METHODS:
+            method = pat_tokens[0]
+            pat_tokens = pat_tokens[1:]
+    elif pat_tokens and method is None and pat_tokens[0] in MATCH_METHODS \
+            and base not in ("src", "dst"):
+        method = pat_tokens[0]
+        pat_tokens = pat_tokens[1:]
+
+    if converter:
+        return AclCriterion(base, arg, method, flags, [],
+                            status="unmodeled",
+                            unmodeled_reason="converter chain on fetch %s "
+                            "(HA12)" % fetch_tok, where=where)
+    if base is None:
+        return AclCriterion(None, None, None, flags, [],
+                            status="unmodeled",
+                            unmodeled_reason="unparseable fetch %r" % fetch_tok,
+                            where=where)
+    if base not in EVALUABLE_FETCHES and not base.endswith("_len"):
+        return AclCriterion(base, arg, method, flags, [],
+                            status="unmodeled",
+                            unmodeled_reason="fetch %s is unmodeled (HA12)"
+                            % fetch_tok, where=where)
+    if base == "hdr" and (arg is None or arg.lower() != "host"):
+        return AclCriterion(base, arg, method, flags, [],
+                            status="unmodeled",
+                            unmodeled_reason="hdr(%s) is unmodeled -- only "
+                            "hdr(host) is evaluable (HA12)" % (arg or ""),
+                            where=where)
+    if base.endswith("_len") and base[:-4] not in EVALUABLE_FETCHES:
+        return AclCriterion(base, arg, method, flags, [],
+                            status="unmodeled",
+                            unmodeled_reason="fetch %s is unmodeled (HA12)"
+                            % fetch_tok, where=where)
+
+    for tok in pat_tokens:
+        if has_env_ref(tok):
+            return AclCriterion(base, arg, method, flags, [],
+                                status="unmodeled",
+                                unmodeled_reason="environment reference in "
+                                "pattern %r (HA18)" % tok, where=where)
+        patterns.append((tok, where))
+    for fname in flags["files"]:
+        if fname.startswith("virt@"):
+            return AclCriterion(base, arg, method, flags, [],
+                                status="unmodeled",
+                                unmodeled_reason="-f virt@ file %r exists "
+                                "only in memory (HA11)" % fname, where=where)
+        fpath = fname if os.path.isabs(fname) else os.path.join(
+            config_dir or ".", fname)
+        try:
+            with open(fpath, "r", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return AclCriterion(base, arg, method, flags, [],
+                                status="unmodeled",
+                                unmodeled_reason="-f file %r unreadable "
+                                "(HA11)" % fname, where=where)
+        for lineno, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            patterns.append((line, "%s:%d" % (fpath, lineno)))
+        cfg.add_finding("HA11", "info",
+                        "expanded -f pattern file %s (%d patterns)"
+                        % (fname, len(patterns)), where)
+    if method is None:
+        method = "int" if base in ("dst_port",) or base.endswith("_len") \
+            else "str"
+    crit = AclCriterion(base, arg, method, flags, patterns,
+                        where=where)
+    crit.operator = operator
+    return crit
+
+
+# ------------------------------------------------------------- condition AST
+
+def split_condition(tokens):
+    """Split condition tokens into OR-groups of AND-terms.
+    Returns (groups, error): groups is a list of lists of term
+    token-lists; each term is (negated, term_tokens)."""
+    groups = [[]]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "or":
+            groups.append([])
+            i += 1
+            continue
+        negated = False
+        if tok == "!":
+            negated = True
+            i += 1
+            if i >= len(tokens):
+                return None, "dangling ! in condition"
+            tok = tokens[i]
+        elif tok.startswith("!"):
+            # Attached negation: `!post` and `!{ ... }` are both
+            # legal in HAProxy conditions.
+            negated = True
+            tok = tok[1:]
+            if not tok:
+                return None, "dangling ! in condition"
+        if tok == "{":
+            depth = 1
+            j = i + 1
+            while j < len(tokens) and depth:
+                if tokens[j] == "{":
+                    depth += 1
+                elif tokens[j] == "}":
+                    depth -= 1
+                j += 1
+            if depth:
+                return None, "unbalanced { in condition"
+            groups[-1].append((negated, tokens[i + 1:j - 1], True))
+            i = j
+            continue
+        groups[-1].append((negated, [tok], False))
+        i += 1
+    if any(not g for g in groups):
+        return None, "empty condition group"
+    return groups, None
+
+
+def split_rule_condition(tokens):
+    """Split the tail of a use_backend/http-request line into
+    (cond_tokens, unless_flag, error). Returns (None, False, None)
+    for an unconditional rule; error is a string when the tail is
+    present but is not a condition."""
+    if not tokens:
+        return None, False, None
+    if tokens[0] == "if":
+        return tokens[1:], False, None
+    if tokens[0] == "unless":
+        return tokens[1:], True, None
+    return None, False, "no if/unless"
+
+
+def find_condition_start(tokens):
+    """Find the index of a standalone `if`/`unless` token in a
+    rule's argument tokens (scanning from the end, so an `if`
+    inside a quoted value is not mistaken). Returns -1 if none."""
+    for i in range(len(tokens) - 1, -1, -1):
+        if tokens[i] in ("if", "unless"):
+            return i
+    return -1
+
+# ------------------------------------------------------------- loader/parser
+
+PREDEFINED_ACLS = ("TRUE", "FALSE", "METH_GET", "METH_POST",
+                   "METH_HEAD", "METH_OPTIONS", "METH_TRACE",
+                   "METH_PUT", "METH_DELETE", "METH_CONNECT",
+                   "LOCALHOST", "HTTP", "HTTP_1.0", "HTTP_1.1",
+                   "HTTP_2", "HTTP_3", "WAIT_END")
+
+
+class IfFrame:
+    def __init__(self, active, decidable):
+        self.active = active        # this branch is live
+        self.decidable = decidable  # the condition could be decided
+        self.seen_true = active     # some branch already taken
+
+
+class Parser:
+    def __init__(self):
+        self.cfg = Config()
+        self.current = None         # current Section
+        self.order = 0
+        self.defines = {}           # .define name -> value
+        self.if_stack = []
+        self.include_stack = []     # realpaths of active includes
+        self.section_names = {}     # (kind, name) -> first Section
+
+    # -- preprocessor expression evaluation (HA19/SS2.4) --
+    def eval_if_expr(self, expr):
+        """Evaluate a .if expression. Returns (value, decidable).
+        Only literals and .define'd names are decidable; anything
+        referencing the environment is undecidable (HA18) -- the
+        tool never reads its own environment."""
+        tokens = re.findall(r'"[^"]*"|\S+', expr)
+        pos = [0]
+
+        def peek():
+            return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+        def parse_or():
+            val, dec = parse_and()
+            while peek() == "||":
+                pos[0] += 1
+                rval, rdec = parse_and()
+                dec = dec and rdec
+                val = (val or rval) if dec else val
+            return val, dec
+
+        def parse_and():
+            val, dec = parse_unary()
+            while peek() == "&&":
+                pos[0] += 1
+                rval, rdec = parse_unary()
+                dec = dec and rdec
+                val = (val and rval) if dec else val
+            return val, dec
+
+        def parse_unary():
+            if peek() == "!":
+                pos[0] += 1
+                val, dec = parse_unary()
+                return (not val) if dec else (False, False)
+            if peek() == "(":
+                pos[0] += 1
+                val, dec = parse_or()
+                if peek() == ")":
+                    pos[0] += 1
+                return val, dec
+            return parse_atom()
+
+        def parse_atom():
+            tok = peek()
+            if tok is None:
+                return False, False
+            pos[0] += 1
+            if tok.startswith("defined("):
+                name = tok[len("defined("):].rstrip(")")
+                return (name in self.defines), True
+            if tok.startswith('"'):
+                left = tok[1:-1]
+                op = peek()
+                if op in ("==", "!=", "<", ">", "<=", ">="):
+                    pos[0] += 1
+                    right = peek()
+                    if right is None:
+                        return False, False
+                    pos[0] += 1
+                    if right.startswith('"'):
+                        right = right[1:-1]
+                    elif right in self.defines:
+                        right = self.defines[right]
+                    else:
+                        return False, False
+                    if op == "==":
+                        return left == right, True
+                    if op == "!=":
+                        return left != right, True
+                    return False, False
+                return bool(left), True
+            if tok in self.defines:
+                return bool(self.defines[tok]), True
+            if tok in ("0", "1"):
+                return tok == "1", True
+            # Bare name that is not defined: environment-dependent.
+            return False, False
+
+        try:
+            val, dec = parse_or()
+            if pos[0] != len(tokens):
+                return False, False
+            return val, dec
+        except Exception:
+            return False, False
+
+    # -- file loading --
+    def load(self, paths):
+        for path in paths:
+            self.parse_file(path, top_level=True)
+        return self.cfg
+
+    def parse_file(self, path, top_level):
+        real = os.path.realpath(path)
+        if real in self.include_stack:
+            raise FatalConfig(".include cycle at %s" % path, path)
+        try:
+            with open(path, "r", errors="replace") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            raise FatalConfig("cannot read config %s: %s" % (path, exc),
+                              path)
+        self.cfg.files.append((path, len(raw.encode("utf-8", "replace")),
+                               raw.count("\n") + 1))
+        saved_current = self.current
+        if top_level:
+            # A top-level file must start with a section header: a
+            # section ends at a file boundary (HA19).
+            self.current = None
+        self.include_stack.append(real)
+        first_content_seen = False
+        try:
+            for lineno, line in enumerate(raw.splitlines(), 1):
+                where = "%s:%d" % (path, lineno)
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped.startswith("."):
+                    self.handle_preprocessor(stripped, where, path)
+                    continue
+                if any(not f.active for f in self.if_stack):
+                    # Inside a false .if branch: line is inactive.
+                    sec = self.current.name if self.current else None
+                    self.cfg.gated_blocks.append(
+                        (where, sec, "inside inactive .if branch"))
+                    continue
+                if top_level and not first_content_seen:
+                    first_content_seen = True
+                    toks = tokenize(stripped)
+                    if not toks or toks[0] not in SECTION_KINDS:
+                        raise FatalConfig(
+                            "file %s opens mid-section (first line is "
+                            "not a section header)" % path, where)
+                self.parse_line(stripped, where, path)
+        finally:
+            self.include_stack.pop()
+            if top_level:
+                self.current = None
+            else:
+                self.current = saved_current
+
+    def handle_preprocessor(self, stripped, where, path):
+        toks = tokenize(stripped)
+        if not toks:
+            return
+        directive = toks[0]
+        parent_active = all(f.active for f in self.if_stack)
+        # For .elif/.else the "parent" is the enclosing frames only
+        # -- the current frame itself must not gate its own siblings.
+        enclosing_active = all(f.active for f in self.if_stack[:-1])
+        if directive == ".define":
+            if parent_active and len(toks) >= 3:
+                self.defines[toks[1]] = " ".join(toks[2:])
+            elif parent_active and len(toks) == 2:
+                self.defines[toks[1]] = ""
+            return
+        if directive == ".include":
+            if not parent_active:
+                return
+            if len(toks) < 2:
+                self.cfg.add_finding("HA19", "warning",
+                                     ".include with no file", where)
+                return
+            inc = toks[1]
+            inc_path = inc if os.path.isabs(inc) else os.path.join(
+                os.path.dirname(path), inc)
+            self.parse_file(inc_path, top_level=False)
+            return
+        if directive in (".if", ".elif"):
+            if directive == ".if":
+                val, dec = self.eval_if_expr(
+                    " ".join(toks[1:])) if parent_active else (False, True)
+                self.if_stack.append(IfFrame(val and dec, dec))
+                if not dec:
+                    self.cfg.add_finding(
+                        "HA19", "warning",
+                        "undecidable .if gate -- enclosed lines skipped, "
+                        "never resolved from this tool's environment",
+                        where)
+                    self.cfg.gated_blocks.append(
+                        (where,
+                         self.current.name if self.current else None,
+                         "undecidable .if"))
+            else:
+                if not self.if_stack:
+                    self.cfg.add_finding("HA19", "warning",
+                                         ".elif without .if", where)
+                    return
+                frame = self.if_stack[-1]
+                if frame.seen_true:
+                    frame.active = False
+                elif enclosing_active:
+                    val, dec = self.eval_if_expr(" ".join(toks[1:]))
+                    frame.active = val and dec
+                    frame.decidable = dec
+                    frame.seen_true = frame.active
+                else:
+                    frame.active = False
+            return
+        if directive == ".else":
+            if not self.if_stack:
+                self.cfg.add_finding("HA19", "warning",
+                                     ".else without .if", where)
+                return
+            frame = self.if_stack[-1]
+            frame.active = not frame.seen_true and enclosing_active
+            frame.seen_true = frame.seen_true or frame.active
+            return
+        if directive == ".endif":
+            if self.if_stack:
+                self.if_stack.pop()
+            else:
+                self.cfg.add_finding("HA19", "warning",
+                                     ".endif without .if", where)
+            return
+        self.cfg.add_finding("HA19", "warning",
+                             "unknown preprocessor directive %s" % directive,
+                             where)
+
+    # -- section / keyword parsing --
+    def parse_line(self, stripped, where, path):
+        toks = tokenize(stripped)
+        if not toks:
+            return
+        head = toks[0]
+        if self.current is None or head in SECTION_KINDS:
+            if head not in SECTION_KINDS:
+                self.cfg.add_finding(
+                    "HA21", "warning",
+                    "directive outside any section: %s" % stripped, where)
+                return
+            name = toks[1] if len(toks) > 1 else None
+            from_name = None
+            if len(toks) > 2 and toks[2] == "from" and len(toks) > 3:
+                from_name = toks[3]
+            elif len(toks) > 2 and toks[2] == "from":
+                self.cfg.add_finding("HA21", "warning",
+                                     "from with no defaults name", where)
+            if head == "global" and name is not None:
+                self.cfg.add_finding("HA21", "warning",
+                                     "global takes no name", where)
+            self.order += 1
+            sec = Section(head, name, from_name, where, self.order)
+            key = (head, name)
+            if key in self.section_names:
+                self.cfg.add_finding(
+                    "HA16", "finding",
+                    "duplicate %s %s -- references resolve to the first "
+                    "definition" % (head, name or ""), where)
+            else:
+                self.section_names[key] = sec
+            self.cfg.sections.append(sec)
+            if head == "defaults" and name:
+                self.cfg.defaults_by_name.setdefault(name, sec)
+            self.current = sec
+            return
+        self.parse_keyword(self.current, toks, stripped, where, path)
+
+    def parse_keyword(self, sec, toks, stripped, where, path):
+        kw = toks[0]
+        if kw == "bind":
+            self.parse_bind(sec, toks, where)
+            return
+        if kw == "mode":
+            if len(toks) >= 2:
+                sec.mode = (toks[1], where)
+            else:
+                sec.unparseable.append((stripped, where))
+            return
+        if kw == "default_backend":
+            if len(toks) >= 2:
+                sec.default_backend = (toks[1], where)
+            else:
+                sec.unparseable.append((stripped, where))
+            return
+        if kw == "disabled":
+            sec.disabled = True
+            return
+        if kw == "acl":
+            if len(toks) < 3:
+                sec.unparseable.append((stripped, where))
+                return
+            name = toks[1]
+            if sec.kind == "defaults":
+                # ACLs never live in defaults (HA03): a config error
+                # in real HAProxy; report it and make the ACL
+                # available nowhere.
+                self.cfg.add_finding(
+                    "HA03", "finding",
+                    "acl %s declared in a defaults section -- ACLs "
+                    "are not legal in defaults and are available "
+                    "nowhere" % name, where)
+                return
+            crit = parse_criterion(toks[2:], where,
+                                   os.path.dirname(path), self.cfg)
+            if crit.status == "unmodeled":
+                self.cfg.add_finding(
+                    "HA12", "info",
+                    "ACL %s in %s %s is unmodeled: %s"
+                    % (name, sec.kind, sec.name or "", crit.unmodeled_reason),
+                    where)
+            sec.acls.setdefault(name, []).append(crit)
+            return
+        if kw == "use_backend":
+            if len(toks) < 2:
+                sec.unparseable.append((stripped, where))
+                return
+            if sec.kind not in ("frontend", "listen"):
+                # use_backend is frontend/listen only (HA03).
+                self.cfg.add_finding(
+                    "HA03", "finding",
+                    "use_backend in a %s section -- only "
+                    "frontend/listen sections switch backends"
+                    % sec.kind, where)
+                return
+            target = toks[1]
+            dynamic = target.startswith("%[")
+            cond_tokens = None
+            if len(toks) > 2:
+                cond, unless_flag, err = split_rule_condition(toks[2:])
+                if err:
+                    sec.unparseable.append((stripped, where))
+                    return
+                if cond is not None:
+                    cond_tokens = (cond, unless_flag)
+            sec.use_backends.append(UseBackendRule(target, cond_tokens,
+                                                   where, dynamic))
+            return
+        if kw == "http-request":
+            if len(toks) < 2:
+                sec.unparseable.append((stripped, where))
+                return
+            action = toks[1]
+            idx = find_condition_start(toks[2:])
+            if idx >= 0:
+                args = toks[2:2 + idx]
+                cond_toks = toks[2 + idx:]
+                cond, unless_flag, err = split_rule_condition(cond_toks)
+                if err:
+                    sec.unparseable.append((stripped, where))
+                    return
+                cond_tokens = (cond, unless_flag) if cond is not None \
+                    else None
+            else:
+                args = toks[2:]
+                cond_tokens = None
+            sec.http_requests.append(HttpRequestRule(action, args,
+                                                     cond_tokens, where))
+            return
+        if kw == "stick-table":
+            sec.stick_table = True
+            return
+        if kw in RECOGNIZED_KEYWORDS:
+            return
+        sec.unparseable.append((stripped, where))
+
+    def parse_bind(self, sec, toks, where):
+        # bind [addr]:port [params...]; addr may be *, empty, a name,
+        # or [ipv6]; port may be a single port or a range lo-hi.
+        if len(toks) < 2:
+            sec.unparseable.append((" ".join(toks), where))
+            return
+        spec = toks[1]
+        addr = None
+        port = None
+        if spec.startswith("["):
+            end = spec.find("]")
+            if end == -1:
+                sec.unparseable.append((" ".join(toks), where))
+                return
+            addr = spec[1:end]
+            rest = spec[end + 1:]
+            if rest.startswith(":"):
+                port = rest[1:]
+        elif spec.count(":") >= 2 and not spec.startswith(":"):
+            # bare IPv6 without brackets and no port -- treat whole
+            # spec as the address.
+            addr = spec
+        elif ":" in spec:
+            addr, port = spec.rsplit(":", 1)
+            if addr == "":
+                addr = None
+        else:
+            port = spec
+        if port is None:
+            sec.unparseable.append((" ".join(toks), where))
+            return
+        try:
+            if "-" in port:
+                lo, hi = port.split("-", 1)
+                port = (int(lo), int(hi))
+            else:
+                port = int(port)
+        except ValueError:
+            sec.unparseable.append((" ".join(toks), where))
+            return
+        sec.binds.append((addr, port))
+
+# ------------------------------------------------------- evaluation engine
+
+class Query:
+    def __init__(self, host, path, method="GET", src=None, port=None,
+                 bind=None):
+        self.host = host
+        self.method = method
+        self.src = src
+        self.port = port
+        self.bind = bind
+        if "?" in path:
+            self.path, self.query = path.split("?", 1)
+            self.pathq = path
+        else:
+            self.path = path
+            self.query = ""
+            self.pathq = path
+        self.url = self.pathq
+
+
+class EvalContext:
+    """Everything one frontend evaluation needs: the config, the
+    query, and the frontend's pinned bind (for dst/dst_port)."""
+    def __init__(self, cfg, query, frontend, pinned_bind=None):
+        self.cfg = cfg
+        self.query = query
+        self.frontend = frontend
+        self.pinned_bind = pinned_bind  # (addr, port) or None
+        self.unmodeled = []             # [(reason, where)]
+        self.regex_used = False
+
+    def note_unmodeled(self, reason, where=None):
+        entry = (reason, where)
+        if entry not in self.unmodeled:
+            self.unmodeled.append(entry)
+
+
+def resolve_defaults_chain(cfg, proxy):
+    """Return the list of defaults sections that feed `proxy`,
+    nearest first (proxy's own named chain, or the nearest
+    preceding defaults plus its `from` chain). Returns
+    (chain, error_finding_or_None)."""
+    chain = []
+    seen = set()
+    if proxy.from_name:
+        cur = cfg.find_defaults(proxy.from_name)
+        if cur is None:
+            return [], ("HA03", "defaults %r named by %s %s does not "
+                        "exist" % (proxy.from_name, proxy.kind,
+                                   proxy.name or ""))
+        while cur is not None:
+            if id(cur) in seen:
+                return chain, ("HA03", "defaults `from` cycle at %s"
+                                % (cur.where,))
+            seen.add(id(cur))
+            chain.append(cur)
+            if cur.from_name:
+                nxt = cfg.find_defaults(cur.from_name)
+                if nxt is None:
+                    return chain, ("HA03", "defaults %r named by "
+                                    "defaults %s does not exist"
+                                    % (cur.from_name, cur.name or ""))
+                cur = nxt
+            else:
+                cur = None
+        return chain, None
+    # Nearest preceding defaults section (positional, HA03).
+    preceding = None
+    for sec in cfg.sections:
+        if sec.kind == "defaults" and sec.order < proxy.order:
+            preceding = sec
+    if preceding is None:
+        return [], None
+    cur = preceding
+    while cur is not None:
+        if id(cur) in seen:
+            return chain, ("HA03", "defaults `from` cycle at %s"
+                            % (cur.where,))
+        seen.add(id(cur))
+        chain.append(cur)
+        if cur.from_name:
+            nxt = cfg.find_defaults(cur.from_name)
+            if nxt is None:
+                return chain, ("HA03", "defaults %r named by defaults "
+                                "%s does not exist"
+                                % (cur.from_name, cur.name or ""))
+            cur = nxt
+        else:
+            cur = None
+    return chain, None
+
+
+def effective_mode(cfg, proxy):
+    """(mode, provenance) -- own mode, else the defaults chain's
+    mode, else tcp [documented: tcp is the default mode]."""
+    if proxy.mode:
+        return proxy.mode[0], proxy.mode[1] + " (own mode line)"
+    chain, _err = resolve_defaults_chain(cfg, proxy)
+    for dsec in chain:
+        if dsec.mode:
+            return dsec.mode[0], dsec.mode[1] + " (defaults %s)" % (
+                dsec.name or "unnamed")
+    return "tcp", "default (no mode line anywhere)"
+
+
+def effective_default_backend(cfg, proxy):
+    """(name, where, provenance) or None."""
+    if proxy.default_backend:
+        return (proxy.default_backend[0], proxy.default_backend[1],
+                "own default_backend line")
+    chain, _err = resolve_defaults_chain(cfg, proxy)
+    for dsec in chain:
+        if dsec.default_backend:
+            return (dsec.default_backend[0], dsec.default_backend[1],
+                    "defaults %s" % (dsec.name or "unnamed"))
+    return None
+
+
+def effective_http_requests(cfg, proxy):
+    """Defaults-chain rules first, then the proxy's own (HA03 --
+    inheritance prepends)."""
+    chain, _err = resolve_defaults_chain(cfg, proxy)
+    rules = []
+    for dsec in reversed(chain):
+        rules.extend(dsec.http_requests)
+    rules.extend(proxy.http_requests)
+    return rules
+
+
+# ------------------------------------------------------------ ACL evaluation
+
+def fetch_value(ctx, fetch, arg):
+    """Return (value, value_kind, status) for an evaluable fetch.
+    status is "ok", "unknown" (needs an input the query lacks), or
+    "unmodeled". value_kind is "str", "int", or "ip"."""
+    q = ctx.query
+    if fetch == "always_true":
+        return True, "bool", "ok"
+    if fetch == "always_false":
+        return False, "bool", "ok"
+    if fetch == "hdr":
+        return q.host, "str", "ok"
+    if fetch == "path":
+        return q.path, "str", "ok"
+    if fetch == "pathq" or fetch == "url":
+        return q.pathq, "str", "ok"
+    if fetch == "method":
+        return q.method, "str", "ok"
+    if fetch == "src":
+        if q.src is None:
+            return None, "ip", "unknown"
+        return q.src, "ip", "ok"
+    if fetch == "dst":
+        if ctx.pinned_bind is None or ctx.pinned_bind[0] is None:
+            return None, "ip", "unknown"
+        return ctx.pinned_bind[0], "ip", "ok"
+    if fetch == "dst_port":
+        if ctx.pinned_bind is None:
+            return None, "int", "unknown"
+        return ctx.pinned_bind[1], "int", "ok"
+    if fetch.endswith("_len"):
+        base = fetch[:-4]
+        val, kind, status = fetch_value(ctx, base, arg)
+        if status != "ok":
+            return None, "int", status
+        return len(str(val)), "int", "ok"
+    return None, None, "unmodeled"
+
+
+def eval_criterion(ctx, crit):
+    """Evaluate one ACL criterion against the query. Returns
+    (tri_value, deciding_description)."""
+    if crit.status == "unmodeled":
+        ctx.note_unmodeled(crit.unmodeled_reason, crit.where)
+        return UNKNOWN, "unmodeled: %s" % crit.unmodeled_reason
+    if crit.method == "reg":
+        ctx.regex_used = True
+    # A `_len` suffix fetch (path_len, hdr_len(host), ...) is an
+    # integer fetch of the base value's length.
+    fetch = crit.fetch
+    method = crit.method or "str"
+    if method == "len":
+        fetch = fetch + "_len"
+        method = "int"
+    value, kind, status = fetch_value(ctx, fetch, crit.arg)
+    if status == "unknown":
+        ctx.note_unmodeled(
+            "fetch %s needs an input the query does not supply "
+            "(--src / pinned bind)" % crit.fetch, crit.where)
+        return UNKNOWN, "fetch %s unavailable" % crit.fetch
+    if status == "unmodeled":
+        ctx.note_unmodeled("fetch %s is unmodeled (HA12)" % crit.fetch,
+                           crit.where)
+        return UNKNOWN, "fetch %s unmodeled" % crit.fetch
+    if method == "found":
+        return (TRUE if value else FALSE), "found"
+    if kind == "bool":
+        return (TRUE if value else FALSE), "constant"
+    if kind == "int":
+        if method not in ("int", "len") and method != "str":
+            pass
+        results = []
+        for pattern, prov in crit.patterns:
+            results.append(match_int(getattr(crit, "operator", None)
+                                     or "eq", value, pattern))
+        if not results:
+            return FALSE, "no patterns"
+        return tri_or(results), "int match"
+    if kind == "ip":
+        if crit.fetch == "src" and crit.method not in (None, "str"):
+            pass
+        results = []
+        for pattern, prov in crit.patterns:
+            r = ip_matches(pattern, value)
+            if r == UNKNOWN:
+                ctx.note_unmodeled(
+                    "src/dst pattern %r is not an IP/CIDR/range "
+                    "(HA12)" % pattern, prov)
+            results.append(r)
+        if not results:
+            return FALSE, "no patterns"
+        return tri_or(results), "ip match"
+    # String fetch.
+    if not crit.patterns:
+        return FALSE, "no patterns"
+    results = []
+    for pattern, prov in crit.patterns:
+        results.append(match_str(method, str(value), pattern,
+                                 crit.flags.get("i", False)))
+    return tri_or(results), "string match"
+
+
+def eval_predefined(ctx, name):
+    """Evaluate a predefined ACL name. Returns (value, decidable)."""
+    q = ctx.query
+    if name == "TRUE":
+        return TRUE, True
+    if name == "FALSE":
+        return FALSE, True
+    if name == "HTTP":
+        return TRUE, True
+    if name.startswith("METH_"):
+        return (TRUE if q.method == name[len("METH_"):] else FALSE), True
+    if name == "LOCALHOST":
+        if q.src is None:
+            ctx.note_unmodeled(
+                "LOCALHOST needs --src (HA10)", None)
+            return UNKNOWN, True
+        r = ip_matches("127.0.0.0/8", q.src)
+        if r == FALSE:
+            r = ip_matches("::1/128", q.src)
+        return r, True
+    # HTTP_1.0/1.1/2/3 depend on the request version (no CLI input);
+    # WAIT_END is runtime state -- both unmodeled (HA12).
+    ctx.note_unmodeled("predefined ACL %s is unmodeled (HA12)" % name,
+                       None)
+    return UNKNOWN, True
+
+
+def eval_term(ctx, section, negated, term_tokens, is_anonymous):
+    """Evaluate one condition term. Returns (value, description)."""
+    if is_anonymous:
+        crit = parse_criterion(term_tokens, section.where,
+                               None, ctx.cfg)
+        # Anonymous ACLs have no -f files to expand relative to a
+        # config dir (config_dir is None -> relative to cwd); a -f
+        # inside braces is vanishingly rare and is treated as
+        # unmodeled by parse_criterion when it cannot be read.
+        val, desc = eval_criterion(ctx, crit)
+        return (tri_not(val) if negated else val), desc
+    name = term_tokens[0]
+    if name in PREDEFINED_ACLS:
+        val, _dec = eval_predefined(ctx, name)
+        return (tri_not(val) if negated else val), "predefined %s" % name
+    criteria = section.acls.get(name)
+    if criteria is None:
+        ctx.cfg.add_finding(
+            "HA17", "finding",
+            "condition references ACL %r, not defined in %s %s"
+            % (name, section.kind, section.name or ""), section.where)
+        return UNKNOWN, "undefined ACL %s" % name
+    # Same-name ACLs accumulate: the ACL matches if ANY line does.
+    vals = []
+    descs = []
+    for crit in criteria:
+        val, desc = eval_criterion(ctx, crit)
+        vals.append(val)
+        descs.append(desc)
+    val = tri_or(vals)
+    return (tri_not(val) if negated else val), "ACL %s (%s)" % (
+        name, "; ".join(descs))
+
+
+def eval_condition(ctx, section, cond_tokens):
+    """Evaluate a condition: (cond_tokens, unless_flag) or None.
+    Returns (tri_value, deciding_description)."""
+    if cond_tokens is None:
+        return TRUE, "unconditional"
+    tokens, unless_flag = cond_tokens
+    groups, err = split_condition(tokens)
+    if err:
+        return UNKNOWN, "unparseable condition: %s" % err
+    group_vals = []
+    deciding = None
+    for group in groups:
+        term_vals = []
+        for negated, term_toks, is_anon in group:
+            val, desc = eval_term(ctx, section, negated, term_toks,
+                                  is_anon)
+            term_vals.append(val)
+            if val == FALSE and deciding is None:
+                deciding = desc
+        group_vals.append(tri_and(term_vals))
+    val = tri_or(group_vals)
+    if val == FALSE and deciding is None:
+        deciding = "all terms FALSE"
+    if val != FALSE:
+        deciding = "condition %s" % val
+    if unless_flag:
+        val = tri_not(val)
+    return val, deciding or "condition %s" % val
+
+
+# ------------------------------------------------- http-request pre-pass
+
+REWRITE_ACTIONS = ("set-path", "set-pathq", "set-uri", "replace-path",
+                   "replace-pathq", "replace-uri", "set-method",
+                   "set-query", "normalize-uri")
+HEADER_ACTIONS = ("replace-header", "set-header", "del-header",
+                  "add-header")
+TERMINATING_ACTIONS = ("deny", "redirect", "return", "tarpit",
+                       "silent-drop", "block")
+
+
+def is_rewrite_rule(ctx, section, rule):
+    """Is this http-request rule a rewrite of the inputs routing
+    ACLs test (HA13)? Header actions count only for Host; set-var
+    counts only when a routing condition uses var()."""
+    if rule.action in REWRITE_ACTIONS:
+        return True
+    if rule.action in HEADER_ACTIONS:
+        return bool(rule.args) and rule.args[0].lower() == "host"
+    if rule.action == "set-var":
+        for r in section.use_backends:
+            if r.cond_tokens and "var(" in " ".join(r.cond_tokens[0]):
+                return True
+        return False
+    return False
+
+
+def http_request_prepass(ctx, section):
+    """Walk the effective http-request rules (defaults first).
+    Returns ("ok", trace) or ("UNKNOWN", blocker) or
+    ("SHORT-CIRCUIT", rule)."""
+    trace = []
+    for rule in effective_http_requests(ctx.cfg, section):
+        val, desc = eval_condition(ctx, section, rule.cond_tokens)
+        rewrite = is_rewrite_rule(ctx, section, rule)
+        terminating = rule.action in TERMINATING_ACTIONS
+        if not rewrite and not terminating:
+            trace.append((rule, val, "inventoried (not adjudicated)"))
+            continue
+        if rewrite:
+            if val == FALSE:
+                trace.append((rule, val, "rewrite, condition FALSE -- "
+                              "does not fire"))
+                continue
+            # Unconditional, TRUE, or UNKNOWN-conditioned rewrite:
+            # the inputs routing ACLs see are no longer the ones
+            # the user asked about (HA13).
+            return ("UNKNOWN", rule, trace)
+        if terminating:
+            if val == TRUE:
+                return ("SHORT-CIRCUIT", rule, trace)
+            if val == UNKNOWN:
+                return ("UNKNOWN", rule, trace)
+            trace.append((rule, val, "terminating, condition FALSE"))
+    return ("ok", None, trace)
+
+
+# ------------------------------------------------------------ routing walk
+
+def route_frontend(ctx, section):
+    """Evaluate the query in one HTTP frontend/listen. Returns a
+    dict with verdict, backend, decider, trace, and findings."""
+    result = {"frontend": section, "trace": [], "findings": [],
+              "verdict": None, "backend": None, "decider": None,
+              "blocker": None}
+    # Unparseable lines in the selected frontend poison (HA21).
+    if section.unparseable:
+        for line, where in section.unparseable:
+            result["findings"].append(Finding(
+                "HA21", "finding",
+                "unparseable line in selected %s %s: %s"
+                % (section.kind, section.name or "", line), where))
+        result["verdict"] = "UNKNOWN"
+        result["blocker"] = "unparseable line in %s %s" % (
+            section.kind, section.name or "")
+        return result
+    # Gated (skipped .if) lines inside this frontend poison too.
+    for where, sec_name, reason in ctx.cfg.gated_blocks:
+        if sec_name == section.name:
+            result["findings"].append(Finding(
+                "HA19", "finding",
+                "gated lines skipped inside %s %s (%s) -- verdict "
+                "cannot be trusted" % (section.kind, section.name or "",
+                                       reason), where))
+            result["verdict"] = "UNKNOWN"
+            result["blocker"] = "gated .if block in %s" % section.name
+            return result
+    # Defaults-chain defects that affect this proxy poison.
+    _chain, chain_err = resolve_defaults_chain(ctx.cfg, section)
+    if chain_err:
+        fid, msg = chain_err
+        result["findings"].append(Finding(fid, "finding", msg,
+                                          section.where))
+        result["verdict"] = "UNKNOWN"
+        result["blocker"] = msg
+        return result
+    # http-request pre-pass (HA13/HA14).
+    status, blocker, trace = http_request_prepass(ctx, section)
+    result["trace"].extend(trace)
+    if status == "UNKNOWN":
+        result["verdict"] = "UNKNOWN"
+        result["blocker"] = ("http-request rule %s at %s may fire "
+                             "before routing (HA13/HA14)"
+                             % (blocker.action, blocker.where))
+        result["findings"].append(Finding(
+            "HA13" if is_rewrite_rule(ctx, section, blocker) else "HA14",
+            "finding",
+            "http-request %s at %s may fire before backend selection "
+            "-- routing inputs are no longer the queried ones"
+            % (blocker.action, blocker.where), blocker.where))
+        return result
+    if status == "SHORT-CIRCUIT":
+        result["verdict"] = "SHORT-CIRCUIT"
+        result["blocker"] = "http-request %s at %s" % (blocker.action,
+                                                       blocker.where)
+        result["findings"].append(Finding(
+            "HA14", "finding",
+            "request is answered/terminated by http-request %s before "
+            "routing" % blocker.action, blocker.where))
+        return result
+    # use_backend rules in declaration order (HA06).
+    for rule in section.use_backends:
+        val, desc = eval_condition(ctx, section, rule.cond_tokens)
+        if val == TRUE:
+            if rule.dynamic:
+                result["verdict"] = "UNKNOWN"
+                result["blocker"] = (
+                    "dynamic use_backend target %s at %s (HA12)"
+                    % (rule.target, rule.where))
+                result["findings"].append(Finding(
+                    "HA12", "finding",
+                    "dynamic use_backend target %s is unmodeled -- it "
+                    "neither wins nor is skippable" % rule.target,
+                    rule.where))
+                return result
+            target_sec = ctx.cfg.find_backend(rule.target)
+            if target_sec is None:
+                result["findings"].append(Finding(
+                    "HA17", "finding",
+                    "use_backend names undefined backend %r"
+                    % rule.target, rule.where))
+                result["verdict"] = "UNKNOWN"
+                result["blocker"] = "dangling use_backend target %s" % (
+                    rule.target,)
+                return result
+            result["verdict"] = "BACKEND"
+            result["backend"] = rule.target
+            result["decider"] = ("use_backend", rule.where)
+            result["trace"].append(
+                (rule, TRUE, "winner -- condition TRUE (%s)" % desc))
+            # Mode mismatch: the config is broken, the routing line
+            # still decided it (HA02).
+            fe_mode, _ = effective_mode(ctx.cfg, section)
+            be_mode, _ = effective_mode(ctx.cfg, target_sec)
+            if be_mode != fe_mode:
+                result["findings"].append(Finding(
+                    "HA02", "finding",
+                    "mode mismatch: frontend %s is mode %s but backend "
+                    "%s is mode %s" % (section.name or "", fe_mode,
+                                      rule.target, be_mode), rule.where))
+            return result
+        if val == UNKNOWN:
+            result["verdict"] = "UNKNOWN"
+            result["blocker"] = ("use_backend at %s has an UNKNOWN "
+                                 "condition (%s)" % (rule.where, desc))
+            result["trace"].append((rule, UNKNOWN,
+                                   "blocker -- condition UNKNOWN (%s)"
+                                   % desc))
+            return result
+        result["trace"].append((rule, FALSE,
+                               "evaluated-false (%s)" % desc))
+    # No TRUE rule: default_backend, else listen-self, else 503.
+    default = effective_default_backend(ctx.cfg, section)
+    if default is not None:
+        name, where, prov = default
+        if ctx.cfg.find_backend(name) is None:
+            result["findings"].append(Finding(
+                "HA17", "finding",
+                "default_backend names undefined backend %r" % name,
+                where))
+            result["verdict"] = "UNKNOWN"
+            result["blocker"] = "dangling default_backend %s" % name
+            return result
+        result["verdict"] = "BACKEND"
+        result["backend"] = name
+        result["decider"] = ("default-fallback", where)
+        result["trace"].append(
+            (None, TRUE, "default-fallback %s (%s)" % (name, prov)))
+        return result
+    if section.kind == "listen":
+        result["verdict"] = "BACKEND"
+        result["backend"] = section.name
+        result["decider"] = ("listen-self", section.where)
+        result["trace"].append(
+            (None, TRUE, "listen-self (no switch matched)"))
+        return result
+    result["verdict"] = "NO-BACKEND"
+    result["blocker"] = "no use_backend matched and no default_backend "
+    " -- real HAProxy returns 503"
+    return result
+
+# ------------------------------------------------- selection and rendering
+
+def bind_matches(bind_spec, query):
+    """Does a frontend bind (addr, port) satisfy the query's
+    --port/--bind restriction? addr may be None (wildcard)."""
+    addr, port = bind_spec
+    if query.port is not None:
+        if isinstance(port, tuple):
+            if not (port[0] <= query.port <= port[1]):
+                return False
+        elif port != query.port:
+            return False
+    if query.bind is not None:
+        want_addr, want_port = query.bind
+        if want_port is not None:
+            if isinstance(port, tuple):
+                if not (port[0] <= want_port <= port[1]):
+                    return False
+            elif port != want_port:
+                return False
+        if want_addr is not None and addr is not None:
+            if addr.lower() != want_addr.lower():
+                return False
+    return True
+
+
+def parse_bind_arg(text):
+    """Parse --bind ADDR or ADDR:PORT into (addr, port)."""
+    if ":" in text and not text.startswith("["):
+        addr, port = text.rsplit(":", 1)
+        try:
+            return addr or None, int(port)
+        except ValueError:
+            return None, None
+    return text, None
+
+
+def pinned_bind_for(ctx, section):
+    """The single bind addr:port this frontend is pinned to for
+    dst/dst_port evaluation (HA07): the frontend's only bind, or
+    the one bind a --bind/--port restriction singles out."""
+    binds = section.binds
+    if not binds:
+        return None
+    if len(binds) == 1:
+        addr, port = binds[0]
+        if isinstance(port, tuple):
+            return None
+        return (addr, port)
+    q = ctx.query
+    if q.bind is not None:
+        want_addr, want_port = q.bind
+        cands = []
+        for addr, port in binds:
+            if want_port is not None:
+                if isinstance(port, tuple):
+                    if not (port[0] <= want_port <= port[1]):
+                        continue
+                elif port != want_port:
+                    continue
+            if want_addr is not None and addr is not None \
+                    and addr.lower() != want_addr.lower():
+                continue
+            cands.append((addr, port))
+        if len(cands) == 1 and not isinstance(cands[0][1], tuple):
+            return cands[0]
+        return None
+    if q.port is not None:
+        cands = [(a, p) for a, p in binds
+                 if (isinstance(p, tuple) and p[0] <= q.port <= p[1])
+                 or p == q.port]
+        addrs = {b[0] for b in cands}
+        ports = {b[1] for b in cands}
+        if len(addrs) == 1 and len(ports) == 1 \
+                and not isinstance(cands[0][1], tuple):
+            return cands[0]
+    return None
+
+
+def coverage_dict(cfg, evaluated, skipped):
+    return {
+        "files": [{"path": p, "bytes": b, "lines": n}
+                  for p, b, n in cfg.files],
+        "sections": {kind: sum(1 for s in cfg.sections if s.kind == kind)
+                     for kind in sorted({s.kind for s in cfg.sections})},
+        "frontends_evaluated": [s.name for s in evaluated],
+        "frontends_skipped": skipped,
+        "unparseable_lines": sum(len(s.unparseable)
+                                 for s in cfg.sections),
+        "gated_blocks": len(cfg.gated_blocks),
+    }
+
+
+def build_report(cfg, query, results, verdict, backend, decider,
+                 blocker, extra_findings, unmodeled, banners):
+    evaluated = [r["frontend"] for r in results]
+    skipped = []
+    for sec in cfg.frontends():
+        if sec not in evaluated:
+            if sec.disabled:
+                skipped.append({"name": sec.name, "reason": "disabled"})
+            else:
+                mode, _prov = effective_mode(cfg, sec)
+                if mode != "http":
+                    skipped.append({"name": sec.name,
+                                    "reason": "[%s-mode]" % mode})
+                else:
+                    skipped.append({"name": sec.name,
+                                    "reason": "not selected by "
+                                    "--port/--bind"})
+    # Dedupe findings: the HA08 port-stripped re-evaluation can
+    # re-add the same structural finding.
+    seen = set()
+    findings = []
+    for f in cfg.findings + extra_findings + [
+            f for r in results for f in r.get("findings", [])]:
+        key = (f.fid, f.severity, f.message, f.where)
+        if key not in seen:
+            seen.add(key)
+            findings.append(f.as_json())
+    report = {
+        "tool": "haproxywho",
+        "version": VERSION,
+        "verdict": verdict,
+        "backend": backend,
+        "decider": decider,
+        "blocker": blocker,
+        "frontends": [],
+        "findings": findings,
+        "unmodeled": [{"reason": r, "where": w}
+                      for r, w in unmodeled],
+        "coverage": coverage_dict(cfg, evaluated, skipped),
+        "banners": banners,
+    }
+    for r in results:
+        sec = r["frontend"]
+        mode, mode_prov = effective_mode(cfg, sec)
+        entry = {
+            "name": sec.name,
+            "kind": sec.kind,
+            "mode": mode,
+            "mode_provenance": mode_prov,
+            "verdict": r["verdict"],
+            "backend": r.get("backend"),
+            "decider": r.get("decider"),
+            "blocker": r.get("blocker"),
+            "trace": [],
+        }
+        for rule, val, note in r["trace"]:
+            if rule is None:
+                entry["trace"].append({"rule": None, "value": val,
+                                      "note": note})
+            elif isinstance(rule, UseBackendRule):
+                entry["trace"].append(
+                    {"rule": "use_backend %s" % rule.target,
+                     "where": rule.where, "value": val, "note": note})
+            else:
+                entry["trace"].append(
+                    {"rule": "http-request %s" % rule.action,
+                     "where": rule.where, "value": val, "note": note})
+        report["frontends"].append(entry)
+    return report
+
+
+def render_text(report):
+    lines = []
+    verdict = report["verdict"]
+    if verdict == "BACKEND":
+        lines.append("BACKEND %s" % report["backend"])
+    else:
+        lines.append(verdict)
+    if report.get("decider"):
+        kind, where = report["decider"]
+        if kind == "use_backend":
+            lines.append("decider: use_backend at %s" % where)
+        elif kind == "default-fallback":
+            lines.append("decider: default_backend at %s "
+                         "(default-fallback)" % where)
+        elif kind == "listen-self":
+            lines.append("decider: listen section at %s "
+                         "(listen-self)" % where)
+    if report.get("blocker"):
+        lines.append("blocker: %s" % report["blocker"])
+    if len(report["frontends"]) > 1:
+        for fe in report["frontends"]:
+            lines.append("")
+            lines.append("frontend %s (%s, mode %s): %s%s" % (
+                fe["name"], fe["kind"], fe["mode"], fe["verdict"],
+                (" %s" % fe["backend"]) if fe.get("backend") else ""))
+    for fe in report["frontends"]:
+        if fe["trace"]:
+            if len(report["frontends"]) > 1:
+                lines.append("  trace for %s:" % fe["name"])
+            else:
+                lines.append("trace:")
+            for t in fe["trace"]:
+                rule = t["rule"] or "default"
+                where = " (%s)" % t["where"] if t.get("where") else ""
+                lines.append("  %s: %s%s -- %s" % (
+                    t["value"], rule, where, t["note"]))
+    if report["findings"]:
+        lines.append("")
+        lines.append("findings:")
+        for f in report["findings"]:
+            loc = " (%s)" % f["where"] if f.get("where") else ""
+            lines.append("  [%s] %s: %s%s" % (
+                f["id"], f["severity"], f["message"], loc))
+    if report["unmodeled"]:
+        lines.append("")
+        lines.append("unmodeled (HA12 -- bannered, never approximated):")
+        for u in report["unmodeled"]:
+            loc = " (%s)" % u["where"] if u.get("where") else ""
+            lines.append("  - %s%s" % (u["reason"], loc))
+    cov = report["coverage"]
+    lines.append("")
+    lines.append("coverage: %d file(s), %s; frontends evaluated: %s; "
+                 "skipped: %s; unparseable lines: %d; gated blocks: %d"
+                 % (len(cov["files"]),
+                    ", ".join("%s=%d" % kv
+                              for kv in sorted(cov["sections"].items())),
+                    ", ".join(cov["frontends_evaluated"]) or "none",
+                    ", ".join("%s %s" % (s["name"], s["reason"])
+                              for s in cov["frontends_skipped"]) or "none",
+                    cov["unparseable_lines"], cov["gated_blocks"]))
+    for b in report["banners"]:
+        lines.append("banner: %s" % b)
+    return "\n".join(lines) + "\n"
+
+
+BANNERS = [
+    "verdicts cover HTTP-mode frontends/listens only; TCP-mode "
+    "proxies are listed, never verdicted (HA23).",
+    "on-disk policy only: a running daemon's Runtime-API state can "
+    "diverge from these files.",
+    "haproxywho is not a validator: `haproxy -c` remains the "
+    "validation path; broken sections outside the queried chain "
+    "are findings, not verdicts.",
+]
+
+
+def run_query(cfg, query):
+    """Evaluate the query across the selected frontends (HA01).
+    Returns (report, exit_code)."""
+    extra_findings = []
+    # Duplicate-bind detection (HA01).
+    seen_binds = {}
+    for sec in cfg.frontends():
+        for addr, port in sec.binds:
+            key = (addr, port)
+            if key in seen_binds:
+                extra_findings.append(Finding(
+                    "HA01", "finding",
+                    "duplicate bind %s:%s -- %s %s and %s %s both "
+                    "bind it; the socket is ambiguous"
+                    % (addr or "*", port, seen_binds[key][0],
+                       seen_binds[key][1] or "", sec.kind,
+                       sec.name or ""), sec.where))
+            else:
+                seen_binds[key] = (sec.kind, sec.name)
+    # Select frontends: not disabled, bind restriction, HTTP mode.
+    selected = []
+    for sec in cfg.frontends():
+        if sec.disabled:
+            continue
+        if query.port is not None or query.bind is not None:
+            if not any(bind_matches(b, query) for b in sec.binds):
+                continue
+        mode, _prov = effective_mode(cfg, sec)
+        if mode != "http":
+            continue
+        selected.append(sec)
+    if not selected:
+        if query.port is not None or query.bind is not None:
+            any_bind_match = any(
+                any(bind_matches(b, query) for b in sec.binds)
+                for sec in cfg.frontends() if not sec.disabled)
+            verdict = "NO-FRONTEND" if not any_bind_match \
+                else "NO-HTTP-FRONTEND"
+        else:
+            verdict = "NO-HTTP-FRONTEND"
+        blocker = ("no frontend matches --port/--bind"
+                   if verdict == "NO-FRONTEND" else
+                   "no HTTP frontend in this config (HA23)")
+        report = build_report(cfg, query, [], verdict, None, None,
+                              blocker, extra_findings, [], BANNERS)
+        return report, 1
+    results = []
+    unmodeled = []
+    regex_used = False
+    for sec in selected:
+        ctx = EvalContext(cfg, query, sec)
+        ctx.pinned_bind = pinned_bind_for(ctx, sec)
+        r = route_frontend(ctx, sec)
+        results.append(r)
+        for entry in ctx.unmodeled:
+            if entry not in unmodeled:
+                unmodeled.append(entry)
+        if ctx.regex_used:
+            regex_used = True
+    banners = list(BANNERS)
+    if regex_used:
+        banners.append("[regex-approx] a verdict in this run rests on "
+                       "a regex term translated to Python `re` (HA15).")
+    # Combine per-frontend verdicts (HA01).
+    verdicts = {(r["verdict"], r.get("backend")) for r in results}
+    if len(verdicts) == 1:
+        verdict, backend = next(iter(verdicts))
+        decider = None
+        blocker = None
+        for r in results:
+            if r.get("decider"):
+                decider = r["decider"]
+                break
+            if r.get("blocker"):
+                blocker = r["blocker"]
+        exit_code = 0 if verdict == "BACKEND" else 1
+    else:
+        verdict = "BIND-AMBIGUOUS"
+        backend = None
+        decider = None
+        blocker = ("frontends disagree: " + "; ".join(
+            "%s=%s%s" % (r["frontend"].name, r["verdict"],
+                         (" " + r["backend"]) if r.get("backend") else "")
+            for r in results))
+        exit_code = 1
+    # HA08: if --host carries a port, show the port-stripped
+    # alternative as a displayed finding, never the verdict.
+    if ":" in (query.host or ""):
+        stripped = query.host.rsplit(":", 1)[0]
+        alt_query = Query(stripped, query.pathq, query.method,
+                          query.src, query.port, query.bind)
+        alt_results = []
+        for sec in selected:
+            actx = EvalContext(cfg, alt_query, sec)
+            actx.pinned_bind = pinned_bind_for(actx, sec)
+            alt_results.append(route_frontend(actx, sec))
+        alt_verdicts = {(r["verdict"], r.get("backend"))
+                        for r in alt_results}
+        if len(alt_verdicts) == 1:
+            alt_verdict, alt_backend = next(iter(alt_verdicts))
+            if (alt_verdict, alt_backend) != (verdict, backend):
+                extra_findings.append(Finding(
+                    "HA08", "info",
+                    "host %r matched verbatim; port-stripped host %r "
+                    "would give %s%s -- the verbatim verdict above "
+                    "stands" % (query.host, stripped, alt_verdict,
+                                (" " + alt_backend)
+                                if alt_backend else ""),
+                    None))
+    report = build_report(cfg, query, results, verdict, backend,
+                          decider, blocker, extra_findings, unmodeled,
+                          banners)
+    return report, exit_code
+
+
+def list_frontends(cfg):
+    """--list-frontends: every frontend/listen in load order."""
+    out = []
+    for sec in cfg.frontends():
+        mode, mode_prov = effective_mode(cfg, sec)
+        default = effective_default_backend(cfg, sec)
+        binds = ", ".join(
+            "%s:%s" % (addr or "*", port) for addr, port in sec.binds) \
+            or "no bind"
+        out.append({
+            "name": sec.name,
+            "kind": sec.kind,
+            "where": sec.where,
+            "binds": binds,
+            "mode": mode,
+            "mode_provenance": mode_prov,
+            "disabled": sec.disabled,
+            "default_backend": default[0] if default else None,
+            "default_backend_where": default[1] if default else None,
+            "use_backend_count": len(sec.use_backends),
+        })
+    return out
+
+
+def render_frontend_list(entries, as_json):
+    if as_json:
+        return json.dumps({"frontends": entries}, indent=2) + "\n"
+    lines = []
+    for e in entries:
+        lines.append("%s %s (%s) -- binds: %s; mode: %s [%s]%s; "
+                     "default_backend: %s; use_backend rules: %d"
+                     % (e["kind"], e["name"], e["where"], e["binds"],
+                        e["mode"], e["mode_provenance"],
+                        " DISABLED" if e["disabled"] else "",
+                        e["default_backend"] or "none",
+                        e["use_backend_count"]))
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------- main
+
+def load_config(conf_paths):
+    """Resolve --conf paths (repeatable, file or directory) and
+    parse. Returns a Config or raises FatalConfig."""
+    paths = []
+    for p in conf_paths:
+        if os.path.isdir(p):
+            files = sorted(f for f in os.listdir(p)
+                           if f.endswith(".cfg"))
+            for f in files:
+                paths.append(os.path.join(p, f))
+        else:
+            paths.append(p)
+    if not paths:
+        raise FatalConfig("no config files found among: %s"
+                          % ", ".join(conf_paths))
+    parser = Parser()
+    return parser.load(paths)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="haproxywho",
+        description="Which backend would serve Host H path P, and "
+                    "which use_backend line decided it.")
+    ap.add_argument("--host", help="Host header value, verbatim")
+    ap.add_argument("--path", help="request path (origin-form, "
+                    "starting with /)")
+    ap.add_argument("--method", default="GET",
+                    help="HTTP method (default GET)")
+    ap.add_argument("--src", help="source IP of the request")
+    ap.add_argument("--port", type=int,
+                    help="restrict to frontends binding this port")
+    ap.add_argument("--bind",
+                    help="restrict to frontends binding ADDR or "
+                    "ADDR:PORT")
+    ap.add_argument("--conf", action="append", default=[],
+                    help="config file or directory (repeatable); "
+                    "default /etc/haproxy/haproxy.cfg")
+    ap.add_argument("--list-frontends", action="store_true",
+                    help="list frontends/listens instead of routing")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print the verdict line only")
+    ap.add_argument("--version", action="store_true",
+                    help="print version and exit")
+    args = ap.parse_args(argv)
+    if args.version:
+        print("haproxywho %s" % VERSION)
+        return 0
+    conf_paths = args.conf
+    if not conf_paths:
+        default = "/etc/haproxy/haproxy.cfg"
+        if os.path.exists(default):
+            conf_paths = [default]
+        else:
+            print("haproxywho: no --conf given and %s does not exist"
+                  % default, file=sys.stderr)
+            return 2
+    try:
+        cfg = load_config(conf_paths)
+    except FatalConfig as exc:
+        print("haproxywho: %s" % exc.message, file=sys.stderr)
+        return 2
+    if args.list_frontends:
+        entries = list_frontends(cfg)
+        sys.stdout.write(render_frontend_list(entries, args.json))
+        return 0 if entries else 1
+    if not args.host or not args.path:
+        print("haproxywho: --host and --path are required for a "
+              "routing query", file=sys.stderr)
+        return 2
+    if not args.path.startswith("/"):
+        print("haproxywho: --path must start with / (origin-form)",
+              file=sys.stderr)
+        return 2
+    bind = parse_bind_arg(args.bind) if args.bind else None
+    if args.bind and bind == (None, None):
+        print("haproxywho: cannot parse --bind %r" % args.bind,
+              file=sys.stderr)
+        return 2
+    query = Query(args.host, args.path, args.method, args.src,
+                  args.port, bind)
+    report, exit_code = run_query(cfg, query)
+    if args.quiet:
+        if report["verdict"] == "BACKEND":
+            print("BACKEND %s" % report["backend"])
+        else:
+            print(report["verdict"])
+        return exit_code
+    if args.json:
+        sys.stdout.write(json.dumps(report, indent=2) + "\n")
+    else:
+        sys.stdout.write(render_text(report))
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
